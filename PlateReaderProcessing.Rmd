@@ -1,0 +1,381 @@
+
+```{r needed libraries}
+library(tidyverse)
+library(ggsignif)
+library(sjmisc)
+library(ggpubr)
+library(broom)
+library(knitr)
+library(readxl)
+library(xlsx)
+library(extrafont)
+library(Cairo) # Macs need XQuartz for this package (used for exporting calibration curve to PDF): https://www.xquartz.org/
+loadfonts()
+library(XML)
+library(methods)
+library(here)
+```
+
+```{r USER INPUT}
+
+# To be used in IL-18 or IL-1Beta assays
+  # ignore if MTT/LDH assay
+  # Ex. 1:5 is dilutionFactor = 5
+dilutionFactor = 1; 
+
+# all input files must be in same location as this .rmd file
+
+# Plate Map .xlsx file requirements:
+  # 1. Sheet that plate map is on must be named "Plate Map"
+  # 2. Columns must be headed 1 through 12
+  # 3. Rows must be headed A through H
+  # 4. Standard wells (if present) must be named with their concentration in ug/mL (including 0.0)
+  # 5. Blank well must be labeled "blank"
+  # 6. Empty wells must be left without label
+xlsxPlateMapFileName = 'Plate Map_NAD_NADH_Pilot.xlsx'
+  # example: 'Plate Map_BMDM_13_MTT.xlsx'
+  # example2:'Plate Map_BMDM_13_IL18.xlsx'
+
+# Data File exported from plate reader requirements:
+  # 1. Must be BOTH (both raw and reduced)
+  # 2. Must be exported as .xml file
+xmlDataFileName = 'NADH Assay_Hour1.xml'
+  # example: 'BMDM13_MTT_12092021.xml'
+  # example2:'BMDM#13_IL18_12092021_GSsample.xml'
+
+# Set OutputFileName (will be xlsx)
+  # 1. DO NOT include ".xlsx"
+  # 2. Date will be appended to end of file name
+outputFileName = 'NADNADHResult'
+  # example: 'BMDM_MTT'
+  # example2:'BMDM_IL18'
+```
+
+```{r READING IN PLATE LAYOUT}
+# reading in whole sheet
+plateLayoutRaw = read_xlsx(path = here(xlsxPlateMapFileName), sheet = 'Plate Map', col_types = 'text', col_names = FALSE)
+
+# finding "1" and "A" in sheet and warning if not correctly oriented
+indexOf1 = which(plateLayoutRaw=="1",arr.ind=TRUE)
+indexOfA = which(plateLayoutRaw=="A",arr.ind=TRUE)
+if( !(indexOf1[1][1]+1==indexOfA[1][1])&(indexOf1[2][1]==(indexOfA[2][1]+1)) )
+  warning('Your plate map is not formatted correctly. Please reformat and try again')
+
+# selecting plate map starting with position of "1"
+plateMap = plateLayoutRaw[c((indexOf1[1,1]+1):(indexOf1[1,1]+8)),c((indexOf1[1,2]):(indexOf1[1,2]+11))]
+rownames(plateMap)<-NULL
+colnames(plateMap)<-NULL
+
+# making list of samples from plate map 
+plateMapTransposed = as.data.frame(t(plateMap)) 
+variableNamesColumn1 <- plateMapTransposed[1] %>%
+  rename("sample" = "V1")
+variableNamesColumn2 <- plateMapTransposed[2] %>%
+  rename("sample" = "V2")
+variableNamesColumn3 <- plateMapTransposed[3] %>%
+  rename("sample" = "V3")
+variableNamesColumn4 <- plateMapTransposed[4] %>%
+  rename("sample" = "V4")
+variableNamesColumn5 <- plateMapTransposed[5] %>%
+  rename("sample" = "V5")
+variableNamesColumn6 <- plateMapTransposed[6] %>%
+  rename("sample" = "V6")
+variableNamesColumn7 <- plateMapTransposed[7] %>%
+  rename("sample" = "V7")
+variableNamesColumn8 <- plateMapTransposed[8] %>%
+  rename("sample" = "V8")
+variableNamesAll = rbind(variableNamesColumn1,variableNamesColumn2,variableNamesColumn3,variableNamesColumn4,variableNamesColumn5,variableNamesColumn6,variableNamesColumn7,variableNamesColumn8)
+```
+
+```{r READING IN PLATE DATA}
+# reading in xml file
+rawDataXML <- xmlParse(file = here(xmlDataFileName))
+rootnodeData <- xmlRoot(rawDataXML)
+
+# finding wavelength and number of wavelengths
+numWavelengths = xmlSize(rootnodeData[[1]][[1]][[2]][[3]])
+wavelengths = xmlToDataFrame(rootnodeData[[1]][[1]][[2]][[3]],c("character"))
+
+# making empty dataframe to fill
+RawDataByWavelength <- data.frame(matrix(ncol = numWavelengths, nrow = 96))
+colnames(RawDataByWavelength) <- as.character(wavelengths[,1])
+
+# filling empty dataframe with data from each wavelength
+for (i in 1:numWavelengths){
+  RawDataByWavelength[i] <- xmlToDataFrame(rootnodeData[[1]][[1]][[3]][[i]][[1]],c("numeric"))
+}
+```
+
+```{r BINDING LAYOUT TO DATA}
+# match samples to data points, drop unnamed wells
+matchedRawData <- cbind(variableNamesAll,RawDataByWavelength) %>%
+  drop_na()
+
+# next have to decide what to do with data: (single wavelength -> fit to standard curve) (two wavelengths -> difference) (more than three wavelengths -> don't know what to do, just export)
+knowWhatToDo = FALSE
+
+# make a new dataframe for the plate layout to be reinserted into final .xlsx file
+plateMapFormatted <- as.data.frame(plateMap) %>%
+  replace(is.na(.),"")
+colnames(plateMapFormatted) <- 1:12
+rownames(plateMapFormatted) <- c("A", "B", "C", "D", "E", "F", "G", "H")
+
+
+```
+
+```{r IL18 and IL1Beta PROCESSING AND OUTPUT}
+# if IL-18 or IL-1Beta assay, make calibration curve and fit data to it
+  # if filepath of xml contains IL18 or IL1beta
+if((numWavelengths == 1) & (str_contains(xmlDataFileName, c("IL18","IL-18","IL1Beta","IL-1Beta","IL-1β", "IL1β"), ignore.case = TRUE, logic = "or"))){
+  knowWhatToDo = TRUE
+  
+  # find absorption correction of blanks
+  colnames(matchedRawData) = c('sample', 'signal')
+
+  samplesBlanks <- matchedRawData %>%
+    mutate(sample = case_when(str_detect(sample, regex('blank', ignore_case = T)) ~ "0",
+                              TRUE ~ sample)) %>%
+    mutate(sample = as.numeric(sample)) %>%
+    drop_na %>%
+    filter(sample == 0)
+  absorbtionCorrection = mean(samplesBlanks$signal)
+  
+  # make new column of adjusted absorbance
+  matchedData <- matchedRawData %>%
+    mutate(CorrectedAbs = signal - absorbtionCorrection)
+
+  # pull out standards and do regression
+  samplesWithNumericNames <- matchedData %>%
+    select(sample, CorrectedAbs) %>%
+    rename(placeHolder=CorrectedAbs) %>%
+    mutate(sample = as.numeric(sample)) %>%
+    drop_na %>%
+    group_by(sample) %>% 
+    summarize(CorrectedAbs =mean(placeHolder), std = sd(placeHolder))
+    
+  quadReg <- lm(sample ~ CorrectedAbs + I(CorrectedAbs^2), data = samplesWithNumericNames)
+  
+  # plot standard curve
+  fontpref = 13
+  samplesWithNumericNames %>%
+    ggplot(aes(x = CorrectedAbs, y = sample, fill = NULL)) +
+    geom_point(colour = "black", size = 1) +
+    geom_errorbar(aes(ymin=sample-(std*max(sample)/max(CorrectedAbs)),
+                      ymax=sample+(std*max(sample)/max(CorrectedAbs))), 
+                  width=.005, 
+                  position=position_dodge(.05)) +
+    stat_smooth(method = "lm", formula = y ~ x + I(x^2), size = 1) +
+    stat_regline_equation(aes(label =  paste(..eq.label.., ..adj.rr.label.., sep = "~~~~")),
+                          formula = y ~ x + I(x^2)) +
+    labs(x = "Signal (AU)", y = "Concentration (pg/mL)") +
+    theme(legend.position = "right",
+          axis.title.x = element_text(size = fontpref, face = 'bold', margin=margin(10,0,0,0)),
+          plot.title = element_text(hjust = 0.5),
+          title = element_text(size = fontpref-3, face = 'bold'),
+          axis.title.y = element_text(size = fontpref, face = 'bold', margin=margin(0,10,0,0)),
+          strip.text = element_text(size = fontpref-6, face = 'bold'),
+          axis.text.y = element_text(size = fontpref, face = 'bold'),
+          plot.caption = element_text(size = fontpref-6, face = 'plain'),
+          legend.title = element_text(size = fontpref-2, face = 'bold'),
+          #legend.position = c(0.85, 0.12),
+          #legend.direction = 'horizontal',
+          legend.text = element_text(size = fontpref-5, face = 'bold'),
+          legend.key.size = unit(2.5, 'line'),
+          axis.text.x = element_text(size = fontpref, angle = 0, vjust = 0.5, face = 'bold'),
+          axis.ticks.x = element_blank())
+  
+  if((str_contains(xmlDataFileName, c("IL18","IL-18"), ignore.case = TRUE, logic = "or"))){
+    assay= "IL18"
+  }else{
+    assay= "IL1Beta"
+  }
+  time = as.character(Sys.time())
+  time = str_replace_all(time, ":", "-")
+  
+  ggsave(
+  #plot = pre_dose3_IgG.spike_corr.plot,
+  device = NULL,
+  filename = here(paste(outputFileName, "Regression", Sys.Date(), ".pdf", sep = "")),
+  units = 'in',
+  width = 12,
+  height = 8
+  )
+  
+  
+  # use regression to calculate concentrations
+  matchedDataConc <- matchedData %>%
+    mutate(CalcConc = predict(quadReg, newdata = matchedData))
+
+  # remove standards from data
+  samplesWithNumericNames2 <- matchedData %>%
+    mutate(sampleNum = as.numeric(sample)) %>%
+    drop_na
+  
+  matchedDataConcNoCal <- matchedDataConc %>%
+    filter(!(sample %in% samplesWithNumericNames2$sample)) %>%
+    mutate(CalcConc = CalcConc*dilutionFactor)
+  colnames(matchedDataConcNoCal) = c('sample', as.character(wavelengths[1]), 'CorrectedAbs', 'CalcConc(pg/mL)' )
+
+  
+  # isolate standards
+  samplesWithNumericNames3 <-  matchedDataConc %>%
+    filter((sample %in% samplesWithNumericNames2$sample))
+  colnames(samplesWithNumericNames3) = c('sample', as.character(wavelengths[1]), 'CorrectedAbs', 'CalcConc(pg/mL)' )
+    
+  # make regression data frame
+  regressionDataFrame = tidy(quadReg)
+  
+  # make diultion factor into data frame
+  
+  # export data to xlsx (in two sheets [w/ cal, w/o cal]), third sheet with calibration graph and equations
+  write.xlsx(plateMapFormatted, file = here(paste(outputFileName, "_", Sys.Date(), ".xlsx", sep="")), sheetName = "Plate Map", append=FALSE)
+  write.xlsx(matchedDataConcNoCal, file = here(paste(outputFileName, "_", Sys.Date(), ".xlsx", sep="")), sheetName = "Data", append=TRUE, row.names = FALSE)
+  write.xlsx(samplesWithNumericNames3, file = here(paste(outputFileName, "_", Sys.Date(), ".xlsx", sep="")), sheetName = "StandardsData", append=TRUE, row.names = FALSE)
+  write.xlsx(regressionDataFrame, file = here(paste(outputFileName, "_", Sys.Date(), ".xlsx", sep="")), sheetName = "Regression", append=TRUE)
+  write.xlsx(as.data.frame(dilutionFactor), file = here(paste(outputFileName, "_", Sys.Date(), ".xlsx", sep="")), sheetName = "Dilution Factor", append=TRUE, row.names = FALSE)
+}
+```
+
+
+```{r NADH AND NAD+ PROCESSING AND OUTPUT}
+# if IL-18 or IL-1Beta assay, make calibration curve and fit data to it
+  # if filepath of xml contains IL18 or IL1beta
+if((numWavelengths == 1) & (str_contains(xmlDataFileName, c("NAD"), ignore.case = TRUE, logic = "or"))){
+  knowWhatToDo = TRUE
+  
+  # find absorption correction of blanks
+  colnames(matchedRawData) = c('sample', 'signal')
+
+  samplesBlanks <- matchedRawData %>%
+    mutate(sample = case_when(str_detect(sample, regex('blank', ignore_case = T)) ~ "0",
+                              TRUE ~ sample)) %>%
+    mutate(sample = as.numeric(sample)) %>%
+    drop_na %>%
+    filter(sample == 0)
+  absorbtionCorrection = mean(samplesBlanks$signal)
+  
+  # make new column of adjusted absorbance
+  matchedData <- matchedRawData %>%
+    mutate(CorrectedAbs = signal - absorbtionCorrection)
+
+  # pull out standards and do regression
+  samplesWithNumericNames <- matchedData %>%
+    select(sample, CorrectedAbs) %>%
+    rename(placeHolder=CorrectedAbs) %>%
+    mutate(sample = as.numeric(sample)) %>%
+    drop_na %>%
+    group_by(sample) %>% 
+    summarize(CorrectedAbs =mean(placeHolder), std = sd(placeHolder))
+    
+  quadReg <- lm(sample ~ CorrectedAbs + I(CorrectedAbs^2), data = samplesWithNumericNames)
+  
+  # plot standard curve
+  fontpref = 13
+  samplesWithNumericNames %>%
+    ggplot(aes(x = CorrectedAbs, y = sample, fill = NULL)) +
+    geom_point(colour = "black", size = 1) +
+    geom_errorbar(aes(ymin=sample-(std*max(sample)/max(CorrectedAbs)),
+                      ymax=sample+(std*max(sample)/max(CorrectedAbs))), 
+                  width=.005, 
+                  position=position_dodge(.05)) +
+    stat_smooth(method = "lm", formula = y ~ x + I(x^2), size = 1) +
+    stat_regline_equation(aes(label =  paste(..eq.label.., ..adj.rr.label.., sep = "~~~~")),
+                          formula = y ~ x + I(x^2)) +
+    labs(x = "Signal (AU)", y = "Concentration (pg/mL)") +
+    theme(legend.position = "right",
+          axis.title.x = element_text(size = fontpref, face = 'bold', margin=margin(10,0,0,0)),
+          plot.title = element_text(hjust = 0.5),
+          title = element_text(size = fontpref-3, face = 'bold'),
+          axis.title.y = element_text(size = fontpref, face = 'bold', margin=margin(0,10,0,0)),
+          strip.text = element_text(size = fontpref-6, face = 'bold'),
+          axis.text.y = element_text(size = fontpref, face = 'bold'),
+          plot.caption = element_text(size = fontpref-6, face = 'plain'),
+          legend.title = element_text(size = fontpref-2, face = 'bold'),
+          #legend.position = c(0.85, 0.12),
+          #legend.direction = 'horizontal',
+          legend.text = element_text(size = fontpref-5, face = 'bold'),
+          legend.key.size = unit(2.5, 'line'),
+          axis.text.x = element_text(size = fontpref, angle = 0, vjust = 0.5, face = 'bold'),
+          axis.ticks.x = element_blank())
+  
+
+  assay= "NAD_NADH"
+  time = as.character(Sys.time())
+  time = str_replace_all(time, ":", "-")
+  
+  ggsave(
+  #plot = pre_dose3_IgG.spike_corr.plot,
+  device = NULL,
+  filename = here(paste(outputFileName, "Regression", Sys.Date(), ".pdf", sep = "")),
+  units = 'in',
+  width = 12,
+  height = 8
+  )
+  
+  
+  # use regression to calculate concentrations
+  matchedDataConc <- matchedData %>%
+    mutate(CalcConc = predict(quadReg, newdata = matchedData))
+
+  # remove standards from data
+  samplesWithNumericNames2 <- matchedData %>%
+    mutate(sampleNum = as.numeric(sample)) %>%
+    drop_na
+  
+  matchedDataConcNoCal <- matchedDataConc %>%
+    filter(!(sample %in% samplesWithNumericNames2$sample)) %>%
+    mutate(CalcConc = CalcConc*dilutionFactor)
+  colnames(matchedDataConcNoCal) = c('sample', as.character(wavelengths[1]), 'CorrectedAbs', 'CalcConc(pg/mL)' )
+
+  
+  # isolate standards
+  samplesWithNumericNames3 <-  matchedDataConc %>%
+    filter((sample %in% samplesWithNumericNames2$sample))
+  colnames(samplesWithNumericNames3) = c('sample', as.character(wavelengths[1]), 'CorrectedAbs', 'CalcConc(pg/mL)' )
+    
+  # make regression data frame
+  regressionDataFrame = tidy(quadReg)
+  
+  # make diultion factor into data frame
+  
+  # export data to xlsx (in two sheets [w/ cal, w/o cal]), third sheet with calibration graph and equations
+  write.xlsx(plateMapFormatted, file = here(paste(outputFileName, "_", Sys.Date(), ".xlsx", sep="")), sheetName = "Plate Map", append=FALSE)
+  write.xlsx(matchedDataConcNoCal, file = here(paste(outputFileName, "_", Sys.Date(), ".xlsx", sep="")), sheetName = "Data", append=TRUE, row.names = FALSE)
+  write.xlsx(samplesWithNumericNames3, file = here(paste(outputFileName, "_", Sys.Date(), ".xlsx", sep="")), sheetName = "StandardsData", append=TRUE, row.names = FALSE)
+  write.xlsx(regressionDataFrame, file = here(paste(outputFileName, "_", Sys.Date(), ".xlsx", sep="")), sheetName = "Regression", append=TRUE)
+  write.xlsx(as.data.frame(dilutionFactor), file = here(paste(outputFileName, "_", Sys.Date(), ".xlsx", sep="")), sheetName = "Dilution Factor", append=TRUE, row.names = FALSE)
+}
+```
+
+
+
+```{r MTT and LDH PROCESSING AND OUTPUT}
+# if MTT or LDH assay, subtract wavelength with lower average abs from wavelength with greater average abs
+  # and if filepath contains MTT or LDH
+if((numWavelengths == 2) & (str_contains(xmlDataFileName, c("MTT","LDH"), ignore.case = TRUE, logic = "or"))){
+  knowWhatToDo = TRUE
+  
+  # subtract wavelengths
+  FinalData <- matchedRawData %>%
+    mutate(CorrectedAbs = case_when(
+      mean(matchedRawData[,2]) >= mean(matchedRawData[,3]) ~  matchedRawData[,2] - matchedRawData[,3],
+      mean(matchedRawData[,3]) < mean(matchedRawData[,3]) ~  matchedRawData[,3] - matchedRawData[,3],
+      TRUE ~ as.numeric(NA)))
+  
+  # export data to xlsx
+  write.xlsx(plateMapFormatted, file = here(paste(outputFileName, "_", Sys.Date(), ".xlsx", sep="")), sheetName = "Plate Map", append=FALSE)
+  write.xlsx(FinalData, file = here(paste(outputFileName, "_", Sys.Date(), ".xlsx", sep="")), sheetName = "Data", append=TRUE, row.names = FALSE)
+}
+
+```
+
+```{r PROCESSING FOR ANYTHING ELSE}
+# if anything else
+if(!knowWhatToDo){
+  write.xlsx(plateMapFormatted, file = here(paste(outputFileName, "_", Sys.Date(), ".xlsx", sep="")), sheetName = "Plate Map", append=FALSE)
+  write.xlsx(matchedRawData, file = here(paste(outputFileName, "_", Sys.Date(), ".xlsx", sep="")), sheetName = "Data", append=TRUE, row.names = FALSE)
+}
+
+
+
+```

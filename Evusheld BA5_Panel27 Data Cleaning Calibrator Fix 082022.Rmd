@@ -1,0 +1,594 @@
+---
+title: "Evusheld Data Cleaning 082022 BA5/Panel 27 with Calibrator Fix"
+output: html_notebook
+---
+
+```{r load required libraries}
+library(tidyverse)
+library(ggsignif)
+library(ggpubr)
+library(broom)
+library(knitr)
+library(readxl)
+library(extrafont)
+library(Cairo)
+library(pwr)
+loadfonts()
+library(FactoMineR)
+library(factoextra)
+library(corrplot)
+library(RColorBrewer)
+library(jtools)
+library(ggrepel)
+library(goeveg)
+library(lubridate)
+library(emojifont)
+library(rstatix)
+library(here)
+```
+
+```{r}
+
+ACE2_files <- list.files(path = here('ACE2 Raw Data BA5'), pattern = "\\.xlsx$", full.names = TRUE)
+
+ACE2_cal_check <- function(i){
+  
+  ACE2.cal_check <- read_xlsx(i, 
+                           sheet = 'ACE2',
+                           col_names = TRUE) %>% 
+    select(Sample, Assay, Concentration) %>%
+    filter(Sample == "S001" & Assay == "SARS-Cov-2 Spike") %>% 
+    group_by(Sample, Assay) %>% 
+    summarise(Conc = mean(Concentration))
+  
+  
+  if (ACE2.cal_check$Conc != 0) {
+    
+    ACE2.cal_check.result = "Calibrator Present"
+    
+  }
+  
+  if (ACE2.cal_check$Conc == 0) {
+    ACE2.cal_check.result = "No Calibrator"
+  }
+  
+  return(ACE2.cal_check.result)
+}
+
+lapply(ACE2_files, ACE2_cal_check)
+
+```
+
+
+```{r combine files and compute averages of ACE2}
+#ACE2_files <- list.files(path = here('ACE2 Raw Data BA5'), pattern = "\\.xlsx$", full.names = TRUE)
+
+ACE2_read <- function(i){
+  
+  ACE2.cal_check <- read_xlsx(i, 
+                           sheet = 'ACE2',
+                           col_names = TRUE) %>% 
+    select(Sample, Assay, Concentration) %>%
+    filter(Sample == "S001" & Assay == "SARS-Cov-2 Spike") %>% 
+    group_by(Sample, Assay) %>% 
+    summarise(Conc = mean(Concentration))
+  
+  print(ACE2.cal_check$Conc)
+  
+  if (ACE2.cal_check$Conc != 0) {
+    
+      ACE2.conc <- read_xlsx(i, 
+                           sheet = 'ACE2',
+                           col_names = TRUE) %>% 
+  select(Sample, Assay, Dilution, `Calc. Concentration`, `Detection Limits: Calc. Low`,`Detection Limits: Calc. High`, `Detection Range`) %>%
+  filter(str_detect(Sample, '^S0', negate = TRUE)) %>%
+  filter(str_detect(Sample, regex('blank', ignore_case = TRUE), negate = TRUE)) %>%  
+  rename(Conc = `Calc. Concentration`) %>% 
+  rename(LLOD = `Detection Limits: Calc. Low`) %>% 
+  rename(ULOD = `Detection Limits: Calc. High`) %>%
+  rename(Range = `Detection Range`) %>%
+  mutate(Conc = as.numeric(Conc),
+         LLOD = as.numeric(LLOD),
+         ULOD = as.numeric(ULOD)) %>% 
+  mutate(ULOD = Dilution * ULOD) %>% 
+  mutate(Conc = case_when(
+    is.na(ULOD) ~ NaN,
+    is.na(LLOD) ~ NaN,
+    Range == 'Below Fit Curve Range' ~ 0,
+    Range == 'Below Detection Range' ~ LLOD,
+    is.na(Conc) & Range == 'Above Detection Range' ~ ULOD,
+    is.na(Conc) & Range == 'Above Fit Curve Range' ~ ULOD,
+    TRUE ~ as.numeric(Conc))) %>% 
+  group_by(Sample, Assay, Dilution) %>%
+  mutate(Mean_Conc = mean(Conc)) %>%
+  ungroup() %>% 
+  select(-Conc) %>% 
+  rename(Conc = Mean_Conc) %>% 
+  distinct() %>% 
+  mutate(Assay = case_when(
+  Assay == 'SARS-Cov-2 Spike' ~ 'SARS-CoV-2 Spike',
+  TRUE ~ as.character(Assay))) %>% 
+  filter(Assay != 'SARS-CoV-2 Nucleocapsid') %>% 
+  mutate(Range = case_when(
+    Conc >= ULOD ~ 'Above',
+    Conc < LLOD ~ 'Below',
+    TRUE ~ as.character('In Range')
+  ))
+  
+  ACE2.inh <- read_xlsx(i, 
+                           sheet = 'ACE2',
+                           col_names = TRUE) %>% 
+  select(`Plate Name`, Sample, Assay, Dilution,`Adjusted Signal`) %>%
+  filter(str_detect(Sample, regex('blank', ignore_case = TRUE), negate = TRUE)) %>%  
+  rename(Plate = `Plate Name`) %>%
+  rename(AdjSig = `Adjusted Signal`) %>%
+  group_by(Sample, Assay) %>%
+  mutate(SigMean = mean(AdjSig),
+         CV = cv(AdjSig)) %>%
+  ungroup() %>%
+  group_by(Plate, Assay) %>% 
+  mutate(Inhibition = (1-(SigMean/(SigMean[which(Sample == 'S008')])))*100) %>% 
+  ungroup() %>%
+  select(-Plate, -SigMean) %>% 
+  filter(str_detect(Sample, '^S0', negate = TRUE)) %>%
+  filter(Dilution == 100) %>% 
+  group_by(Sample, Assay, Dilution) %>%
+  mutate(Mean_Inhib = mean(Inhibition)) %>%
+  select(-Inhibition) %>%
+  rename(Inhibition = Mean_Inhib) %>% 
+  distinct() %>% 
+  mutate(Assay = case_when(
+    Assay == 'SARS-Cov-2 Spike' ~ 'SARS-CoV-2 Spike',
+    TRUE ~ as.character(Assay))) %>% 
+  filter(Assay != 'SARS-CoV-2 Nucleocapsid') %>% 
+  select(Sample, Assay, CV, Inhibition)
+
+  ACE2.tot <- ACE2.conc %>% 
+    left_join(ACE2.inh)
+  
+  SampleList <- read_xlsx(i, 
+                           sheet = 'Sample List',
+                           col_names = TRUE) %>% 
+                select(`Study ID`, `Visit Date`, `Visit`, Cohort, `Run`, `Note`, `Sample Name`) %>% 
+                rename(Study_ID = `Study ID`) %>% 
+                rename(Sample = `Sample Name`) %>%
+                rename(Visit_Date = `Visit Date`) %>% 
+                filter(str_detect(Sample, regex('blank', ignore_case = TRUE), negate = TRUE)) %>%  
+                mutate(
+                  Study_ID = as.character(Study_ID),
+                  Visit_Date = ymd(Visit_Date),
+                  Visit = as.character(Visit),
+                  Cohort = as.character(Cohort),
+                  Run = as.character(Run))
+  
+  ACE2.comb <- SampleList %>% 
+    left_join(ACE2.tot) %>% 
+    distinct()
+   
+  }
+
+  if (ACE2.cal_check$Conc == 0) {
+      ACE2.inh <- read_xlsx(i,
+                           sheet = 'ACE2',
+                           col_names = TRUE) %>%
+  select(`Plate Name`, Sample, Assay, Dilution,`Adjusted Signal`) %>%
+  filter(str_detect(Sample, regex('blank', ignore_case = TRUE), negate = TRUE)) %>%
+  rename(Plate = `Plate Name`) %>%
+  rename(AdjSig = `Adjusted Signal`) %>%
+  mutate(Sample = case_when(
+    str_detect(Sample, "S00") ~ "S00",
+    TRUE ~ as.character(Sample)
+  )) %>%
+  group_by(Sample, Assay) %>%
+  mutate(SigMean = mean(AdjSig),
+         CV = cv(AdjSig)) %>%
+  ungroup() %>%
+  group_by(Assay) %>%
+  mutate(Inhibition = (1-(SigMean/(SigMean[which(Sample == 'S00')])))*100) %>%
+  ungroup() %>%
+  select(Sample, Assay, Inhibition, CV, Dilution) %>%
+  filter(str_detect(Sample, '^S00', negate = TRUE)) %>%
+  distinct() %>%
+  mutate(Assay = case_when(
+    Assay == 'SARS-Cov-2 Spike' ~ 'SARS-CoV-2 Spike',
+    TRUE ~ as.character(Assay))) %>%
+  filter(Assay != 'SARS-CoV-2 Nucleocapsid') %>%
+  select(Sample, Assay, Inhibition, CV, Dilution)
+
+  SampleList <- read_xlsx(i,
+                           sheet = 'Sample List',
+                           col_names = TRUE) %>%
+                select(`Study ID`, `Visit Date`, `Visit`, Cohort, `Run`, `Note`, `Sample Name`) %>%
+                rename(Study_ID = `Study ID`) %>%
+                rename(Sample = `Sample Name`) %>%
+                rename(Visit_Date = `Visit Date`) %>%
+                filter(str_detect(Sample, regex('blank', ignore_case = TRUE), negate = TRUE)) %>%
+                mutate(
+                  Study_ID = as.character(Study_ID),
+                  Visit_Date = ymd(Visit_Date),
+                  Visit = as.character(Visit),
+                  Cohort = as.character(Cohort),
+                  Run = as.character(Run))
+
+  ACE2.comb <- SampleList %>%
+    left_join(ACE2.inh) %>%
+    distinct()
+  
+  }
+  
+
+return(ACE2.comb) 
+}
+ACE2.data.list <- lapply(ACE2_files, ACE2_read)
+
+ACE2.data.temp = dplyr::bind_rows(ACE2.data.list)
+
+```
+c("SARS-CoV-2 Spike", "SARS-CoV-2 Spike (B.1.351)", "SARS-CoV-2 Spike (B.1.617.2; AY.4)", "SARS-CoV-2 Spike (BA.2)", "SARS-CoV-2 Spike (BA.2.12.1)", "SARS-CoV-2 Spike (BA.3)", "SARS-CoV-2 Spike (BA.4)", "SARS-CoV-2 Spike (BA.5)"), VOC = c("Ancestral", "Beta (B.1.351)", "Delta (B.1.617.2)", "Omicron (BA.2)", "Omicron (BA.2.12.1)", "Omicron (BA.3)", "Omicron (BA.4)", "Omicron (BA.5)")
+
+```{r}
+VOCs <- tibble(Assay = c("SARS-CoV-2 Spike", "SARS-CoV-2 Spike (B.1.1.7)", "SARS-CoV-2 Spike (B.1.351)", "SARS-CoV-2 Spike (P.1)", "SARS-CoV-2 Spike (B.1.617.2)", "SARS-CoV-2 Spike (B.1.1.529)", "SARS-CoV-2 Spike (B.1.617.2; AY.4)", "SARS-CoV-2 Spike (BA.2)", "SARS-CoV-2 Spike (BA.2.12.1)", "SARS-CoV-2 Spike (BA.4)", "SARS-CoV-2 Spike (BA.5)"), VOC = c("Ancestral Strain", "Alpha (B.1.1.7)", "Beta (B.1.351)", "Gamma (P.1)", "Delta (B.1.617.2)", "Omicron (BA.1)", "Delta (B.1.617.2)","Omicron (BA.2)", "Omicron (BA.2.12.1)", "Omicron (BA.4)", "Omicron (BA.5)")) %>% 
+  mutate(
+    Assay = factor(Assay),
+    VOC = factor(VOC)
+  )
+VOCs
+```
+
+```{r combine and tidy}
+ACE2.data <- ACE2.data.temp  %>%
+  filter(str_detect(Note, "Evusheld")) %>%
+  filter(!is.na(Assay)) %>% 
+  select(Study_ID, Visit, Cohort, Note, Assay, Inhibition, Conc, Range, CV, Run) %>% 
+  left_join(VOCs) %>% 
+  #remove duplicates and prioritizes low CV runs
+  distinct() %>% 
+  mutate(CV = case_when(
+    is.na(CV) ~ 0,
+    TRUE ~ as.numeric(CV))) %>% 
+  group_by(Study_ID, Visit, Assay) %>%
+  mutate(min_CV = min(CV)) %>% 
+  arrange(Study_ID, Assay) %>% 
+  mutate(low_CV = case_when(
+    CV == min_CV ~ TRUE,
+    CV != min_CV ~ FALSE
+  )) %>% 
+  filter(low_CV == TRUE) %>% 
+  select(-min_CV, -low_CV) %>% 
+  mutate(Inhibition = case_when(
+    Inhibition < 0 ~ 0,
+    TRUE ~ as.numeric(Inhibition)
+  ))
+  
+ACE2.data
+
+#this is another check for duplicates
+
+problem.list.ACE2 <- 
+ACE2.data %>%
+  group_by(Study_ID, Visit, Assay) %>% 
+  summarise(n = n()) %>% 
+  filter(n != 1)
+problem.list.ACE2
+
+problem.list.VOC <- 
+  ACE2.data %>%
+  filter(!is.na(VOC)) %>% 
+  group_by(Study_ID, Visit, VOC) %>% 
+  summarise(n = n()) %>% 
+  filter(n != 1)
+problem.list.VOC
+
+ACE2.VOC.data <-
+  ACE2.data %>% 
+  filter(!is.na(VOC)) %>%
+  group_by(Study_ID, Visit, VOC) %>%
+  mutate(mean.inh = mean(Inhibition)) %>% 
+  ungroup() %>% 
+  select(-Inhibition) %>% 
+  rename(Inhibition = mean.inh) %>%
+  select(Study_ID, Visit, Cohort, VOC, Conc, Inhibition, Range, CV, Run) %>% 
+  distinct()
+ACE2.VOC.data
+```
+
+
+```{r}
+
+#Visit_Key <- tibble(Visit = c("30", "32", "31", "33", "36"), Time_Point = c("Pre", "2 Wks", "1 mo", "3 mo", "6 mo")) %>% 
+ # mutate(
+  #  Time_Point = factor(Time_Point, levels = c("Pre", "2 Wks", "1 mo", "3 mo", "6 mo"))
+  #)
+#Visit_Key
+```
+
+```{r}
+#ACE2.VOC.data <- 
+#ACE2.VOC.data %>% 
+ # left_join(Visit_Key)
+
+ACE2.VOC.data %>% 
+  group_by(Study_ID, Visit, VOC) %>% 
+  summarise(n = n()) %>% 
+  filter(n != 1)
+
+```
+
+```{r combine files and compute averages of IgG}
+CoV3_files <- list.files(path = here('ACE2 and IgG Raw Data'), pattern = "\\.xlsx$", full.names = TRUE)
+
+IgG_read <- function(i){
+  CoV3 <- read_xlsx(i, 
+                           sheet = 'CoV3',
+                           col_names = TRUE) %>% 
+    select(Sample, Assay, Dilution, `Calc. Concentration`, `Detection Limits: Calc. Low`, `Detection Limits: Calc. High`, `Detection Range`) %>%
+  filter(str_detect(Sample, '^S0', negate = TRUE)) %>%
+  filter(str_detect(Sample, regex('blank', ignore_case = TRUE), negate = TRUE)) %>% 
+  rename(Conc = `Calc. Concentration`) %>% 
+  rename(LLOD = `Detection Limits: Calc. Low`) %>% 
+  rename(ULOD = `Detection Limits: Calc. High`) %>%
+  rename(Detection_Range = `Detection Range`) %>% 
+  mutate(ULOD = Dilution * ULOD) %>% 
+  mutate(Conc = case_when(
+    Conc == "NaN" & Detection_Range == "Above Fit Curve Range" ~ ULOD,
+    is.na(Conc) & Detection_Range == "Above Fit Curve Range" ~ ULOD,
+    Conc == 'NaN' & Detection_Range != "Above Fit Curve Range" ~ 0,
+    is.na(Conc) & Detection_Range != "Above Fit Curve Range" ~ 0,
+    TRUE ~ as.numeric(Conc))) %>%
+  select(-Detection_Range) %>% 
+  group_by(Sample, Assay, Dilution) %>%
+  mutate(Mean_Conc = mean(Conc),
+         CV = cv(Conc)) %>%
+  ungroup() %>% 
+  select(-Conc) %>% 
+  rename(Conc = Mean_Conc) %>% 
+  distinct() %>% 
+  mutate(Assay = case_when(
+  Assay == 'SARS-Cov-2 Spike' ~ 'SARS-CoV-2 Spike',
+  Assay == 'HCov-NL63 Spike' ~ 'HCoV-NL63 Spike',
+  TRUE ~ as.character(Assay)))
+
+  
+  SampleList <- read_xlsx(i, 
+                           sheet = 'Sample List',
+                           col_names = TRUE) %>% 
+                select(`Study ID`, `Visit Date`, `Visit`, Cohort, `Run`, `Note`, `Sample Name`) %>%
+                rename(Study_ID = `Study ID`) %>% 
+                rename(Sample = `Sample Name`) %>%
+                rename(Visit_Date = `Visit Date`) %>% 
+                filter(str_detect(Sample, regex('blank', ignore_case = TRUE), negate = TRUE)) %>%  
+                mutate(
+                  Study_ID = as.character(Study_ID),
+                  Visit_Date = ymd(Visit_Date),
+                  Visit = as.character(Visit),
+                  Cohort = as.character(Cohort),
+                  Run = as.character(Run))
+  
+  IgG.comb <- SampleList %>% 
+    left_join(CoV3) %>% 
+    ungroup() %>% 
+    distinct()
+
+}
+IgG.data.list <- lapply(CoV3_files, IgG_read)
+
+IgG.data.temp = dplyr::bind_rows(IgG.data.list)
+```
+
+
+```{r}
+cutoff.data <- read_xlsx('MSD IgG Cutoff.xlsx', 
+                           #sheet = 'ACE2',
+                           col_names = TRUE)%>% 
+  mutate(
+    Assay = factor(Assay),
+    Assay_Type = factor(Assay_Type)) %>% 
+    mutate(WHO_Cutoff = case_when(
+    Assay == 'SARS-CoV-2 Nucleocapsid' ~ Result * 0.00246,
+    Assay == 'SARS-CoV-2 Spike' ~ Result * 0.00901,
+    Assay == 'SARS-CoV-2 S1 RBD' ~ Result * 0.0272,
+    TRUE ~ as.numeric(NA)
+  )) %>% 
+  select(Assay, WHO_Cutoff)
+cutoff.data
+```
+
+```{r combine and tidy IgG}
+IgG.data <- 
+  IgG.data.temp  %>%
+  filter(str_detect(Note, "Evusheld")) %>% 
+  select(Study_ID, Visit_Date, Visit, Sample, Cohort, Assay, Conc, CV, LLOD, ULOD) %>%
+  mutate(CV = case_when(
+  is.na(CV) ~ 0,
+  TRUE ~ as.numeric(CV))) %>% 
+  group_by(Sample, Assay) %>%
+  mutate(min_CV = min(CV)) %>%
+  ungroup() %>% 
+  distinct() %>% 
+  mutate(low_CV = case_when(
+    CV == min_CV ~ TRUE,
+    CV != min_CV ~ FALSE
+  )) %>% 
+  filter(low_CV == TRUE) %>% 
+  select(-min_CV, -low_CV) %>% 
+  select(-CV) %>%
+  distinct() %>% 
+  ungroup() %>% 
+  mutate(Range = case_when(
+    Conc <= LLOD ~ 'Below',
+    Conc > ULOD ~ 'Above',
+    TRUE ~ as.character('In Range')
+  )) %>%
+  select(Study_ID, Visit, Visit_Date, Cohort, Assay, Conc, LLOD, ULOD, Range) %>% 
+  mutate(WHO_Units = case_when(
+    Assay == 'SARS-CoV-2 Nucleocapsid' ~ Conc * 0.00246,
+    Assay == 'SARS-CoV-2 Spike' ~ Conc * 0.00901,
+    Assay == 'SARS-CoV-2 S1 RBD' ~ Conc * 0.0272,
+    TRUE ~ as.numeric(NA)
+  )) %>%
+  left_join(cutoff.data) %>% 
+  mutate(Above_Cut = case_when(
+    WHO_Units > WHO_Cutoff ~ TRUE,
+    WHO_Units < WHO_Cutoff ~ FALSE,
+    is.na(WHO_Units) ~ NA
+  )) %>% 
+  #left_join(Visit_Key) %>% 
+  filter(!is.na(WHO_Units)) %>% 
+  ungroup()
+
+#this is another check for duplicates
+
+duplicate.list <- 
+IgG.data %>%
+  ungroup() %>% 
+  group_by(Study_ID, Visit, Assay) %>% 
+  summarise(n = n()) %>% 
+  filter(n != 1) %>% 
+  ungroup()
+duplicate.list
+
+IgG.data %>%
+  distinct() %>% 
+  filter(Study_ID %in% duplicate.list$Study_ID)
+```
+
+```{r}
+CCpatient.data <- read_xlsx("CC paired list.xlsx") %>% 
+  select(`Record ID`, Dosage, `E1 Date`, `E2 Date`) %>% 
+  rename(Study_ID = `Record ID`,
+         E1_Date = `E1 Date`,
+         E2_Date = `E2 Date`) %>% 
+  mutate(
+    Study_ID = as.character(Study_ID),
+    E1_Date = ymd(E1_Date),
+    E2_Date = ymd(E2_Date)
+  )
+CCpatient.data
+
+```
+
+
+```{r}
+N_ACE2 = length(unique(ACE2.VOC.data$Study_ID))
+N_ACE2
+
+N_IgG = length(unique(IgG.data$Study_ID))
+N_IgG
+
+ACE2.VOC.data %>% 
+  filter(VOC == "Omicron (BA.2)") %>% 
+  group_by(Visit) %>% 
+  tally()
+
+IgG.data %>% 
+  filter(Assay == "SARS-CoV-2 Spike") %>% 
+  group_by(Visit) %>% 
+  tally()
+
+ACE2.VOC.data <- 
+  ACE2.VOC.data %>% 
+  mutate(Cohort = case_when(
+    Study_ID %in% CCpatient.data$Study_ID ~ "Rheum_Vax",
+    TRUE ~ as.character(Cohort)
+  ))
+
+IgG.data <- 
+  IgG.data %>% 
+  mutate(Cohort = case_when(
+    Study_ID %in% CCpatient.data$Study_ID ~ "Rheum_Vax",
+    TRUE ~ as.character(Cohort)
+  ))
+
+BA5.ACE2.SOTR.data <- 
+  ACE2.VOC.data %>% 
+  filter(Cohort != "Rheum_Vax")
+
+BA5.ACE2.Rheum.data <- 
+  ACE2.VOC.data %>% 
+  filter(Cohort == "Rheum_Vax")
+
+IgG.SOTR.data <- 
+  IgG.data %>% 
+  filter(Cohort != "Rheum_Vax")
+
+IgG.Rheum.data <- 
+  IgG.data %>% 
+  filter(Cohort == "Rheum_Vax")
+```
+
+
+
+```{r}
+Current_Date <- Sys.Date()
+
+ACE2_SOTR_File_Name <- paste("BA5_ACE2_Evusheld_SOTR_", Current_Date, ".csv", sep = "")
+ACE2_Rheum_File_Name <- paste("BA5_ACE2_Evusheld_Rheum_", Current_Date, ".csv", sep = "")
+IgG_SOTR_File_Name <- paste("IgG_Evusheld_SOTR_", Current_Date, ".csv", sep = "")
+IgG_Rheum_File_Name <- paste("IgG_Evusheld_Rheum_", Current_Date, ".csv", sep = "")
+
+write_excel_csv(x = BA5.ACE2.SOTR.data, file = ACE2_SOTR_File_Name)
+write_excel_csv(x = BA5.ACE2.Rheum.data, file = ACE2_Rheum_File_Name)
+write_excel_csv(x = IgG.SOTR.data, file = IgG_SOTR_File_Name)
+write_excel_csv(x = IgG.Rheum.data, file = IgG_Rheum_File_Name)
+```
+
+
+```{r}
+fontpref = 22
+
+ACE2_Evusheld_File_Name <- paste("ACE2 Inhibition_Evusheld_", Current_Date, ".pdf", sep = "")
+
+ACE2.VOC.data %>%
+  #filter(Time_Point %in% c("Pre", "2 Wks", "1 mo")) %>% 
+  ggplot(aes(x = Visit, y = Inhibition, group = Study_ID)) + 
+    facet_wrap(~VOC,
+               scales = "free_x") +
+    geom_line(alpha = 0.25) +
+    geom_boxplot(inherit.aes = FALSE,
+      mapping = aes(x = Visit, y = Inhibition),
+      alpha = 0,
+      size = 0.5) +
+    geom_point(
+      #position = "jitter",
+      #aes(color = exposure, size = Special),
+      size = 1) + 
+    labs(
+      title = 'Evusheld ACE2 Inhibition',
+      x = 'Time Point',
+      y = '%ACE2 Inhibition',
+      caption = paste0("N = ", N_ACE2)) +
+    #scale_x_discrete(
+     # breaks = c('0', '14', '30', '90'),
+      #labels = c('Day 0', 'Day 14', 'Day 30', 'Day 90')) +
+    theme_classic() +
+    theme(
+      plot.title = element_text(hjust = 0.5),
+      title = element_text(size = fontpref-3, face = 'bold'),
+      #axis.title.x = element_blank(),
+      axis.title.x = element_text(size = fontpref, face = 'bold'),
+      axis.title.y = element_text(size = fontpref, face = 'bold', margin=margin(0,20,0,0)),
+      strip.text = element_text(size = fontpref-6, face = 'bold'),
+      axis.text.y = element_text(size = fontpref, face = 'bold'),
+      plot.caption = element_text(size = fontpref-6, face = 'plain'),
+      legend.title = element_text(size = fontpref-2, face = 'bold'),
+      #legend.position = c(0.85, 0.12),
+      legend.direction = 'horizontal',
+      legend.position = "bottom",
+      legend.text = element_text(size = fontpref-5, face = 'bold'),
+      legend.key.size = unit(2.5, 'line'),
+      axis.text.x = element_text(size = fontpref-5, angle = 0, vjust = 0.5, face = 'bold'),
+      axis.ticks.x = element_blank())
+  
+  ggsave(
+  #paired.90.ACE2.plot,
+  device = cairo_pdf,
+  filename = ACE2_Evusheld_File_Name,
+  units = 'in',
+  width = 12,
+  height = 8
+)
+```
+
+
+
+
