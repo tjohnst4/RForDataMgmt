@@ -1,2 +1,2 @@
 # RForDataMgmt
-# This folder contains a few of the R scripts that I have developed for my present position.
+# This folder contains a few of the R scripts that I have developed for my current position.
