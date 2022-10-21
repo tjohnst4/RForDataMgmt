@@ -1,0 +1,880 @@
+---
+title: "D4 IgG Data Cleaning EDA 020122"
+output: html_notebook
+---
+
+```{r load required libraries}
+library(tidyverse)
+library(ggsignif)
+library(ggpubr)
+library(broom)
+library(knitr)
+library(readxl)
+library(extrafont)
+library(Cairo)
+library(pwr)
+loadfonts()
+library(FactoMineR)
+library(factoextra)
+library(corrplot)
+library(RColorBrewer)
+library(jtools)
+library(ggrepel)
+library(goeveg)
+library(lubridate)
+library(emojifont)
+library(rstatix)
+library(here)
+```
+
+```{r combine files and compute averages of IgG}
+CoV3_files <- list.files(path = here('Raw Data'), pattern = "\\.xlsx$", full.names = TRUE)
+
+IgG_read <- function(i){
+  CoV3 <- read_xlsx(i, 
+                           sheet = 'CoV3',
+                           col_names = TRUE) %>% 
+    select(Sample, Assay, Dilution, `Calc. Concentration`, `Detection Limits: Calc. Low`, `Detection Limits: Calc. High`) %>%
+  filter(str_detect(Sample, '^S0', negate = TRUE)) %>% #ignore standards
+  filter(str_detect(Sample, regex('blank', ignore_case = TRUE), negate = TRUE)) %>% #ignore blans
+  rename(Conc = `Calc. Concentration`) %>% 
+  rename(LLOD = `Detection Limits: Calc. Low`) %>% 
+  rename(ULOD = `Detection Limits: Calc. High`) %>%
+  mutate(ULOD = Dilution * ULOD) %>% 
+  mutate(Conc = case_when(
+    Conc == 'NaN' ~ 0,
+    is.na(Conc) ~ 0,
+    TRUE ~ as.numeric(Conc))) %>% 
+  group_by(Sample, Assay, Dilution) %>% # need to sort by note here; but we haven't assigned notes yet
+  mutate(Mean_Conc = mean(Conc),
+         CV = cv(Conc)) %>% #CV of mean Conc, rather than mean signal
+  ungroup() %>% 
+  select(-Conc) %>% 
+  rename(Conc = Mean_Conc) %>% 
+  distinct() %>% 
+  mutate(Assay = case_when(
+  Assay == 'SARS-Cov-2 Spike' ~ 'SARS-CoV-2 Spike',
+  Assay == 'HCov-NL63 Spike' ~ 'HCoV-NL63 Spike',
+  TRUE ~ as.character(Assay))) %>% 
+  distinct() # eliminate about half
+
+  
+  SampleList <- read_xlsx(i, 
+                           sheet = 'Sample List',
+                           col_names = TRUE) %>% 
+                select(`Study ID`, `Visit Date`, `Visit`, Cohort, `Run`, `Note`, `Sample Name`) %>%
+                rename(Study_ID = `Study ID`) %>% 
+                rename(Sample = `Sample Name`) %>%
+                rename(Visit_Date = `Visit Date`) %>%
+                rename(Sample_Type = Note) %>% # Sample type is now "note"
+                filter(str_detect(Sample, regex('blank', ignore_case = TRUE), negate = TRUE)) %>%  
+                mutate(
+                  Study_ID = as.character(Study_ID),
+                  #Visit_Date = ymd(Visit_Date),
+                  Visit = as.character(Visit),
+                  Cohort = as.character(Cohort),
+                  Sample_Type = as.character(Sample_Type),
+                  Run = as.character(Run))
+  
+  IgG.comb <- SampleList %>% 
+    left_join(CoV3) %>% 
+    distinct()
+
+}
+IgG.data.list <- lapply(CoV3_files, IgG_read)
+
+IgG.data.temp = dplyr::bind_rows(IgG.data.list)
+
+
+```
+
+```{r additional reading functions}
+
+IgG_read2 <- function(i){
+    SampleList <- read_xlsx(i, 
+                           sheet = 'Sample List',
+                           col_names = TRUE) %>% 
+                select(`Study ID`, `Visit Date`, `Visit`, Cohort, `Run`, `Note`, `Sample Name`) %>%
+                rename(Study_ID = `Study ID`) %>% 
+                rename(Sample = `Sample Name`) %>%
+                rename(Visit_Date = `Visit Date`) %>%
+                rename(Sample_Type = Note) %>% # Sample type is now "note"
+                filter(str_detect(Sample, regex('blank', ignore_case = TRUE), negate = TRUE)) %>%  
+                mutate(
+                  Study_ID = as.character(Study_ID),
+                  #Visit_Date = ymd(Visit_Date),
+                  Visit = as.character(Visit),
+                  Cohort = as.character(Cohort),
+                  Sample_Type = as.character(Sample_Type),
+                  Run = as.character(Run)) %>%
+                mutate(Sample = case_when(Sample == "482_6" & Sample_Type == "D4_post_2" ~ "482_6_2",
+                                          TRUE ~ as.character(Sample))) # alright, set the second one to 482_6_2 temporarily
+  
+  CoV3 <- read_xlsx(i, 
+                           sheet = 'CoV3',
+                           col_names = TRUE) %>% 
+                select(Sample, Assay, Dilution, `Calc. Concentration`, `Detection Limits: Calc. Low`, `Detection Limits: Calc. High`, Well) %>%
+                filter(str_detect(Sample, '^S0', negate = TRUE)) %>% #ignore standards
+                filter(str_detect(Sample, regex('blank', ignore_case = TRUE), negate = TRUE)) %>% #ignore blans
+                rename(Conc = `Calc. Concentration`) %>% 
+                rename(LLOD = `Detection Limits: Calc. Low`) %>% 
+                rename(ULOD = `Detection Limits: Calc. High`) %>%
+                mutate(ULOD = Dilution * ULOD) %>% 
+                mutate(Conc = case_when(
+                  Conc == 'NaN' ~ 0,
+                  is.na(Conc) ~ 0,
+                  TRUE ~ as.numeric(Conc))) %>%
+                mutate(Sample = case_when(Well == "F05" | Well == "F06" ~ "482_6_2",
+                                          TRUE ~ as.character(Sample)))%>%
+                select(-Well)
+  
+  IgG.comb <- SampleList %>% 
+                left_join(CoV3) %>% 
+                #mutate(Sample = case_when(Sample == "482_6_2"  ~ "482_6", TRUE ~ as.character(Sample))) %>% 
+                distinct() %>%
+                group_by(Sample, Assay, Dilution, Sample_Type) %>% # need to sort by note/sample_type
+                mutate(Mean_Conc = mean(Conc),
+                       CV = cv(Conc)) %>% #CV of mean Conc, rather than mean signal
+                ungroup() %>% 
+                select(-Conc) %>% 
+                rename(Conc = Mean_Conc) %>%
+                mutate(Assay = case_when(
+                  Assay == 'SARS-Cov-2 Spike' ~ 'SARS-CoV-2 Spike',
+                  Assay == 'HCov-NL63 Spike' ~ 'HCoV-NL63 Spike',
+                  TRUE ~ as.character(Assay))) %>% 
+                distinct() 
+  
+
+}
+
+IgG.data.list2 <- lapply(CoV3_files, IgG_read2)
+
+IgG.data.temp2 = dplyr::bind_rows(IgG.data.list2)
+
+```
+
+```{r error check; find excluded samples}
+exludedSamples <- IgG.data.temp %>%
+  filter(!(Sample %in% IgG.data.temp2$Sample))
+```
+
+```{r combine and tidy}
+IgG.data <- 
+  IgG.data.temp2  %>%
+  #filter(Cohort == 'CPAT_Pilot') %>% 
+  select(Study_ID, Visit_Date, Visit, Sample_Type, Sample, Cohort, Assay, Conc, CV, LLOD, ULOD) %>%
+  #remove duplicates and prioritizes low CV runs
+  distinct() %>% 
+  mutate(CV = case_when(
+    is.na(CV) ~ 0,
+    TRUE ~ as.numeric(CV))) %>% 
+  group_by(Sample, Assay) %>%
+  mutate(min_CV = min(CV)) %>%
+  ungroup() %>% 
+  distinct() %>% 
+  mutate(low_CV = case_when(
+    CV == min_CV ~ TRUE,
+    CV != min_CV ~ FALSE
+  )) %>% 
+  filter(low_CV == TRUE) %>% 
+  select(-min_CV, -low_CV) %>% 
+  select(-CV) %>%
+  filter(str_detect(Sample_Type, "D4")) %>% #only want D4 data
+  distinct() %>% 
+  ungroup() 
+
+#this is another check for duplicates
+
+duplicate.list <- 
+IgG.data %>%
+  ungroup() %>% 
+  group_by(Sample, Assay) %>% 
+  summarise(n = n()) %>% 
+  filter(n != 1) %>% 
+  ungroup()
+duplicate.list
+
+IgG.data %>%
+  distinct() %>% 
+  filter(Sample %in% duplicate.list$Sample)
+```
+
+
+```{r combine with visit data}
+visit.data <- read_excel(path = here('D4_D5_Evusheld Request 012622.xlsx'), 
+           sheet = "Request", 
+           col_names = TRUE,
+           col_types = c("text", "text", "text", "date", "text", "text", "text", "date", "date", "date")) %>% 
+  select(Study_ID, Timepoint, Cohort, Sample_Type, D4_Date, Sample_Date) %>% 
+  mutate(Sample = paste(Study_ID,"_",Timepoint,sep = "")) %>% 
+  rename(
+    Visit = Timepoint,
+    Dose_Cohort = Cohort) %>% 
+  mutate(Sample = case_when(Sample == "482_6" & Sample_Type == "D4_post_2" ~ "482_6_2",
+                            TRUE ~ as.character(Sample))) %>%
+  filter(!Dose_Cohort %in% c("D5", "Evusheld")) 
+
+D4.data <- IgG.data %>%
+  ungroup() %>% 
+  left_join(visit.data) %>% 
+  filter(Assay %in% c("SARS-CoV-2 S1 RBD", "SARS-CoV-2 Spike", "SARS-CoV-2 Nucleocapsid")) %>% 
+  select(Study_ID, Visit, Sample_Type, Dose_Cohort, D4_Date, Sample_Date, Assay, Conc) %>% 
+  mutate(Dose_Cohort = case_when(
+    is.na(Dose_Cohort) ~ "D4",
+    TRUE ~ as.character(Dose_Cohort)
+  )) %>% 
+  mutate(
+    Sample_Type = factor(Sample_Type, levels = c("D4_pre", "D4_post_1", "D4_post_2")),
+    Visit = factor(Visit)
+  ) %>% 
+  mutate(D4_Date = ymd(D4_Date)) %>% 
+  mutate(Sample_Date = ymd(Sample_Date))%>%
+  mutate(WHO_Units = case_when(
+    Assay == 'SARS-CoV-2 Nucleocapsid' ~ Conc * 0.00246,
+    Assay == 'SARS-CoV-2 Spike' ~ Conc * 0.00901,
+    Assay == 'SARS-CoV-2 S1 RBD' ~ Conc * 0.0272,
+    TRUE ~ as.numeric(NA)
+  ))
+
+```
+
+```{r}
+N_IgG = length(unique(D4.data$Study_ID))
+N_IgG
+```
+# ```{r output cleaned data to xlsx}
+# Current_Date <- Sys.Date()
+# CoV_IgG_File_Name <- paste("CoV_IgG_", Current_Date, ".csv", sep = "")
+# CoV_IgG_File_Name
+# 
+# #ACE2_File_Name <- paste("ACE2_D4_", Current_Date, ".csv", sep = "")
+# #ACE2_File_Name
+# 
+# write_excel_csv(x = IgG.data, file = CoV_IgG_File_Name)
+# #write_excel_csv(x = D4.data, file = ACE2_File_Name)
+# ```
+
+```{r calculating WHO Units}
+cutoff.data <- read_xlsx(here('MSD IgG Cutoff.xlsx'), 
+                           #sheet = 'ACE2',
+                           col_names = TRUE)%>% 
+  mutate(
+    Assay = factor(Assay),
+    Assay_Type = factor(Assay_Type)) %>% 
+    mutate(WHO_Units = case_when(
+    Assay == 'SARS-CoV-2 Nucleocapsid' ~ Result * 0.00246,
+    Assay == 'SARS-CoV-2 Spike' ~ Result * 0.00901,
+    Assay == 'SARS-CoV-2 S1 RBD' ~ Result * 0.0272,
+    TRUE ~ as.numeric(NA)
+  ))
+cutoff.data
+```
+
+```{r post1 data: Day 14 sample isolation}
+D4.post1.list <- 
+D4.data %>% 
+  filter(Sample_Type == "D4_post_1")
+
+D4.post1.data <-
+D4.data %>%
+  filter(Study_ID %in% D4.post1.list$Study_ID) %>% 
+  filter(Sample_Type %in% c('D4_pre', 'D4_post_1'))
+D4.post1.data
+
+n_day14 = length(unique(D4.post1.data$Study_ID))
+```
+
+```{r post2 data: d30 sample isolation}
+D4.post2.list <- D4.data %>% 
+  filter(Sample_Type == "D4_post_2")
+
+D4.pre.list <- D4.data %>% 
+  filter(Sample_Type == "D4_pre")
+
+D4.post2.data <-D4.data %>%
+  filter((Study_ID %in% D4.post2.list$Study_ID) & (Study_ID %in% D4.pre.list$Study_ID)) %>% 
+  filter(Sample_Type %in% c('D4_pre', 'D4_post_2'))
+D4.post2.data
+
+n_day30 = length(unique(D4.post2.data$Study_ID))
+
+```
+
+```{r only include patients with a pre and (post1 or post2). If patient has post2, disregard post1. }
+D4.post2.list <- D4.data %>% 
+  filter(Sample_Type == "D4_post_2")
+
+D4.post1.list <- D4.data %>% 
+  filter(Sample_Type == "D4_post_1")
+
+D4.pre.list <- D4.data %>% 
+  filter(Sample_Type == "D4_pre")
+
+D4.presWithPost2.list <- D4.pre.list %>% 
+  filter(Study_ID %in% D4.post2.list$Study_ID)
+
+D4.post2WithPres.list <- D4.post2.list %>%
+  filter(Study_ID %in% D4.presWithPost2.list$Study_ID)
+  
+D4.presWithoutPost2.list <- D4.pre.list %>% 
+  filter(!Study_ID %in% D4.presWithPost2.list$Study_ID)
+
+D4.presWithoutPost2WithPost1.list <- D4.presWithoutPost2.list %>%
+  filter(Study_ID %in% D4.post1.list$Study_ID)
+
+D4.post1ForPresWithoutPost2 <- D4.post1.list %>%
+  filter(Study_ID %in% D4.presWithoutPost2WithPost1.list$Study_ID)
+
+D4.postCombined.data <- rbind(D4.presWithPost2.list,D4.post2WithPres.list, D4.presWithoutPost2WithPost1.list,D4.post1ForPresWithoutPost2) %>%
+  mutate(Sample_Type = case_when(Sample_Type == "D4_post_1" | Sample_Type == "D4_post_2" ~ "D4_post",
+                                 TRUE ~ as.character(Sample_Type)))
+
+
+
+n_daycombined = length(unique(D4.postCombined.data$Study_ID))
+
+```
+
+
+
+```{r}
+
+D4.postCombined.data2 <- D4.postCombined.data %>%
+    mutate(Sample_Type = factor(Sample_Type, levels = c("D4_pre", "D4_post")))%>%
+    select(-Conc) 
+```
+
+```{r stats}
+D4.postCombined.stats <- D4.postCombined.data %>%
+  mutate(Sample_Type = factor(Sample_Type, levels = c("D4_pre", "D4_post")))%>%
+  select(-Conc) %>%
+  select(-Sample_Date) %>%
+  mutate(WHO_Units = log10(WHO_Units))
+compare_means(WHO_Units ~ Sample_Type, data = D4.postCombined.stats, method = "wilcox.test",paired = TRUE, group.by = "Assay")
+```
+
+```{r plot combined post}
+fontpref = 22
+D4.postCombined.data2 %>%
+  ggplot(aes(x = Sample_Type, y = WHO_Units, group = Study_ID)) + 
+    facet_wrap(~Assay,
+               scales = "free") +
+    geom_line(alpha = 0.25) +
+    geom_point(size = 2) + 
+    geom_boxplot(inherit.aes = FALSE,
+      mapping = aes(x = Sample_Type, y = WHO_Units),
+      alpha = 0,
+      size = 0.5) +
+    labs(
+      x = 'Visit',
+      y = 'WHO Units (BAU/mL)',)+
+      #caption = paste0("N = ", n_daycombined, ", * p < .05, ** p < .01")) +
+    geom_hline(
+                data = cutoff.data,
+                aes(yintercept = WHO_Units),
+                size = 1,
+                linetype = 'dashed'
+              ) + 
+    scale_x_discrete(
+      breaks = c('D4_pre', 'D4_post'),
+      labels = c('Pre', 'Post'),
+      limits = rev(levels(D4.postCombined.data$Sample_Type))) +
+    scale_y_log10(labels = function(x) sprintf("%g", x)) +
+    #labels = function(x) sprintf("%g", x) 
+    #labels = function(x) format(x, scientific = FALSE)
+    stat_compare_means(
+      inherit.aes = FALSE,
+      mapping = aes(x = Sample_Type, y = WHO_Units),
+      size = 5,
+      label = "p.signif",
+      symnum.args = list(cutpoints = c(0, 0.05, 1),
+                         symbols = c("***", "ns")),
+      comparisons = list( c("D4_pre", "D4_post")),
+      label.x.npc = 0.25, 
+      label.y.npc = 0.9,
+      method = 'wilcox.test',
+      paired = TRUE,
+      show.legend = TRUE) +
+    theme_classic() +
+    theme(
+      plot.title = element_text(hjust = 0.5),
+      title = element_text(size = fontpref-3, face = 'bold'),
+      #axis.title.x = element_blank(),
+      axis.title.x = element_text(size = fontpref, face = 'bold'),
+      axis.title.y = element_text(size = fontpref, face = 'bold', margin=margin(0,20,0,0)),
+      strip.text = element_text(size = fontpref-4, face = 'bold'),
+      axis.text.y = element_text(size = fontpref, face = 'bold'),
+      plot.caption = element_text(size = fontpref-3, face = 'plain'),
+      legend.title = element_text(size = fontpref-2, face = 'bold'),
+      #legend.position = c(0.85, 0.12),
+      legend.direction = 'horizontal',
+      legend.position = "bottom",
+      legend.text = element_text(size = fontpref-5, face = 'bold'),
+      legend.key.size = unit(2.5, 'line'),
+      axis.text.x = element_text(size = fontpref-3, angle = 0, vjust = 0.5, face = 'bold'),
+      axis.ticks.x = element_blank())
+  
+  ggsave(
+  #paired.90.ACE2.plot,
+  device = cairo_pdf,
+  filename = "IgG Dose 4 Cohort PrePost Combined.pdf",
+  units = 'in',
+  width = 18,
+  height = 10
+)
+```
+
+```{r}
+Current_Date <- Sys.Date()
+CoV_IgG_File_Name <- paste("CoV_IgG_", Current_Date, ".csv", sep = "")
+CoV_IgG_File_Name
+
+#ACE2_File_Name <- paste("ACE2_D4_", Current_Date, ".csv", sep = "")
+#ACE2_File_Name
+cutoff.data1 <- cutoff.data %>%
+  rename(MSD_Cutoff_WHO = WHO_Units)%>%
+  select(-Assay_Type)%>%
+  select(-Result)
+
+D4.postCombined.data3 <- D4.postCombined.data2 %>%
+  left_join(cutoff.data1)
+
+write_excel_csv(x = D4.postCombined.data3, file = CoV_IgG_File_Name)
+#write_excel_csv(x = D4.data, file = ACE2_File_Name)
+
+```
+
+```{r stat summary}
+D4.postCombined.data3 <- D4.postCombined.data2 %>%
+  pivot_wider(id_cols = c(Study_ID,Assay), names_from = Sample_Type, values_from = WHO_Units) %>%
+  mutate(foldchange = (D4_post-D4_pre)/D4_pre) %>%
+  mutate(foldchange = case_when(is.nan(foldchange) ~ 0, TRUE ~ as.numeric(foldchange))) %>%
+  group_by(Assay)
+
+tapply(D4.postCombined.data3$foldchange, D4.postCombined.data3$Assay, summary)
+```
+```{r combine files and compute averages of ACE2}
+ACE2_files <- list.files(path = here('Raw Data'), pattern = "\\.xlsx$", full.names = TRUE)
+
+ACE2_read <- function(i){
+  
+  ACE2.inh <- read_xlsx(i, 
+                           sheet = 'ACE2',
+                           col_names = TRUE) %>% 
+                select(`Plate Name`, Sample, Assay, Dilution,`Adjusted Signal`, Well) %>%
+                mutate(Sample = case_when(Well == "F05" | Well == "F06" ~ "482_6_2",
+                                          TRUE ~ as.character(Sample)))%>%
+                select(-Well)%>%
+                filter(str_detect(Sample, regex('blank', ignore_case = TRUE), negate = TRUE)) %>% 
+                rename(Plate = `Plate Name`) %>%
+                rename(AdjSig = `Adjusted Signal`) %>% 
+                mutate(Sample = case_when(
+                  str_detect(Sample, "S00") ~ "S00",
+                  TRUE ~ as.character(Sample)
+                )) %>% 
+                group_by(Sample, Assay) %>% 
+                mutate(SigMean = mean(AdjSig),
+                       CV = cv(AdjSig)) %>% 
+                ungroup() %>% 
+                group_by(Assay) %>% 
+                mutate(Inhibition = (1-(SigMean/(SigMean[which(Sample == 'S00')])))*100) %>% 
+                ungroup() %>%
+                select(Sample, Assay, Inhibition, CV) %>% 
+                filter(str_detect(Sample, '^S00', negate = TRUE)) %>%
+                distinct() %>% 
+                mutate(Assay = case_when(
+                  Assay == 'SARS-Cov-2 Spike' ~ 'SARS-CoV-2 Spike',
+                  TRUE ~ as.character(Assay))) %>% 
+                filter(Assay != 'SARS-CoV-2 Nucleocapsid') %>% 
+                select(Sample, Assay, Inhibition, CV)
+
+  SampleList <- read_xlsx(i, 
+                           sheet = 'Sample List',
+                           col_names = TRUE) %>% 
+                select(`Study ID`, `Visit Date`, `Visit`, Cohort, `Run`, `Sample Name`, Note) %>%
+                rename(Study_ID = `Study ID`) %>% 
+                rename(Sample = `Sample Name`) %>%
+                rename(Visit_Date = `Visit Date`) %>% 
+                rename(Sample_Type = Note) %>%
+                filter(str_detect(Sample, regex('blank', ignore_case = TRUE), negate = TRUE)) %>%  
+                mutate(
+                  Study_ID = as.character(Study_ID),
+                  #Visit_Date = ymd(Visit_Date),
+                  Visit = as.character(Visit),
+                  Cohort = as.character(Cohort),
+                  Run = as.character(Run)) %>%
+                mutate(Sample = case_when(Sample == "482_6" & Sample_Type == "D4_post_2" ~ "482_6_2",
+                                          TRUE ~ as.character(Sample))) # alright, set the second one to 482_6_2 temporarily
+  
+  ACE2.comb <- SampleList %>% 
+    left_join(ACE2.inh) %>% 
+    distinct()
+
+}
+ACE2.data.list <- lapply(ACE2_files[1:2], ACE2_read)
+
+ACE2.data.temp = dplyr::bind_rows(ACE2.data.list)
+
+```
+
+```{r}
+VOCs <- tibble(Assay = c("SARS-CoV-2 Spike", "SARS-CoV-2 Spike (B.1.1.7)", "SARS-CoV-2 Spike (B.1.351)", "SARS-CoV-2 Spike (P.1)", "SARS-CoV-2 Spike (B.1.617.2)", "SARS-CoV-2 Spike (B.1.1.529)"), VOC = c("Vaccine Strain","Alpha (B.1.1.7)", "Beta (B.1.351)", "Gamma (P.1)", "Delta (B.1.617.2)", "Omicron (B.1.1.529)")) %>% 
+  mutate(
+    Assay = factor(Assay),
+    VOC = factor(VOC)
+  )
+VOCs
+```
+
+```{r combine and tidy1}
+ACE2.data <- ACE2.data.temp  %>%
+  #filter(Cohort == 'CPAT_Pilot') %>% 
+  select(Study_ID, Visit, Sample, Sample_Type, Cohort, Assay, Inhibition, CV) %>% 
+  left_join(VOCs) %>% 
+  #remove duplicates and prioritizes low CV runs
+  distinct() %>% 
+  mutate(CV = case_when(
+    is.na(CV) ~ 0,
+    TRUE ~ as.numeric(CV))) %>% 
+  group_by(Sample, Assay) %>%
+  mutate(min_CV = min(CV)) %>% 
+  arrange(Sample, Assay) %>% 
+  mutate(low_CV = case_when(
+    CV == min_CV ~ TRUE,
+    CV != min_CV ~ FALSE
+  )) %>% 
+  filter(low_CV == TRUE) %>% 
+  select(-min_CV, -low_CV)
+  
+ACE2.data
+
+#this is another check for duplicates
+
+problem.list.ACE2.2 <- 
+ACE2.data %>%
+  group_by(Sample, Assay) %>% 
+  summarise(n = n()) %>% 
+  filter(n != 1)
+problem.list.ACE2.2
+
+ACE2.data %>% 
+  filter(Sample %in% problem.list.ACE2.2$Sample)
+```
+
+
+```{r combine ACE2 data with visit data}
+visit.data <- read_excel(path = "D4_D5_Evusheld Request 012622.xlsx", 
+                         sheet = "Request", 
+                         col_names = TRUE,
+                         col_types = c("text", "text", "text", "date", "text", "text", "text", "date", "date", "date")) %>% 
+  select(Study_ID, Timepoint, Cohort, Sample_Type, D4_Date, Sample_Date) %>% 
+  mutate(Sample = paste(Study_ID,"_",Timepoint,sep = "")) %>%
+  rename(
+    Visit = Timepoint,
+    Dose_Cohort = Cohort) %>% 
+  mutate(Sample = case_when(Sample == "482_6" & Sample_Type == "D4_post_2" ~ "482_6_2",
+                            TRUE ~ as.character(Sample))) 
+
+D4.data <- ACE2.data %>%
+  ungroup() %>% 
+  left_join(visit.data) %>% 
+  filter(!is.na(VOC)) %>% 
+  filter(!Dose_Cohort %in% c("D5", "Evusheld")) %>% 
+  select(Study_ID, Visit, Sample_Type, Dose_Cohort, D4_Date, Sample_Date, VOC, Inhibition) %>% 
+  mutate(Inhibition = case_when(
+    Inhibition < 0 ~ 0,
+    TRUE ~ as.numeric(Inhibition)
+  )) %>% 
+  mutate(Sample_Type = case_when(
+    is.na(Sample_Type) ~ "D4_pre",
+    TRUE ~ as.character(Sample_Type)
+  )) %>% 
+  mutate(Dose_Cohort = case_when(
+    is.na(Dose_Cohort) ~ "D4",
+    TRUE ~ as.character(Dose_Cohort)
+  )) %>% 
+  mutate(
+    Sample_Type = factor(Sample_Type, levels = c("D4_pre", "D4_post_1", "D4_post_2")),
+    Visit = factor(Visit)
+  ) %>% 
+  mutate(D4_Date = ymd(D4_Date))%>% 
+  mutate(Sample_Date = ymd(Sample_Date))
+  
+  
+
+```
+
+
+```{r}
+N_ACE2 = length(unique(D4.data$Study_ID))
+N_ACE2
+```
+
+```{r post1 data; d14 samples}
+D4.post1.list <- 
+D4.data %>% 
+  filter(Sample_Type == "D4_post_1")
+
+D4.post1.data <-
+D4.data %>%
+  filter(Study_ID %in% D4.post1.list$Study_ID) %>% 
+  filter(Sample_Type %in% c('D4_pre', 'D4_post_1'))
+D4.post1.data
+
+n_day14 = length(unique(D4.post1.data$Study_ID))
+```
+
+
+```{r post2 data; d30 samples}
+D4.post2.list <- 
+D4.data %>% 
+  filter(Sample_Type == "D4_post_2")
+
+D4.post2.data <-
+D4.data %>%
+  filter(Study_ID %in% D4.post2.list$Study_ID) %>% 
+  filter(Sample_Type %in% c('D4_pre', 'D4_post_2'))
+D4.post2.data
+
+n_day30 = length(unique(D4.post2.data$Study_ID))
+```
+
+```{r post combined data}
+D4.post2.list <- D4.data %>% 
+  filter(Sample_Type == "D4_post_2")
+
+D4.post1.list <- D4.data %>% 
+  filter(Sample_Type == "D4_post_1")
+
+D4.pre.list <- D4.data %>% 
+  filter(Sample_Type == "D4_pre")
+
+D4.presWithPost2.list <- D4.pre.list %>% 
+  filter(Study_ID %in% D4.post2.list$Study_ID)
+
+D4.post2WithPres.list <- D4.post2.list %>%
+  filter(Study_ID %in% D4.presWithPost2.list$Study_ID)
+  
+D4.presWithoutPost2.list <- D4.pre.list %>% 
+  filter(!Study_ID %in% D4.presWithPost2.list$Study_ID)
+
+D4.presWithoutPost2WithPost1.list <- D4.presWithoutPost2.list %>%
+  filter(Study_ID %in% D4.post1.list$Study_ID)
+
+D4.post1ForPresWithoutPost2 <- D4.post1.list %>%
+  filter(Study_ID %in% D4.presWithoutPost2WithPost1.list$Study_ID)
+
+D4.postCombined.data <- rbind(D4.presWithPost2.list,D4.post2WithPres.list, D4.presWithoutPost2WithPost1.list,D4.post1ForPresWithoutPost2) %>%
+  mutate(Sample_Type = case_when(Sample_Type == "D4_post_1" | Sample_Type == "D4_post_2" ~ "D4_post",
+                                 TRUE ~ as.character(Sample_Type)))
+
+
+
+n_daycombined = length(unique(D4.postCombined.data$Study_ID))
+```
+
+```{r stats2}
+compare_means(formula = Inhibition ~ Sample_Type,data = D4.postCombined.data, method = "wilcox.test",paired = TRUE, group.by = "VOC")
+```
+
+
+```{r}
+fontpref = 20
+
+D4.postCombined.data2 <- D4.postCombined.data %>%
+  mutate(Sample_Type = factor(Sample_Type, levels = c("D4_pre", "D4_post")))
+
+D4.postCombined.data2 %>%
+  ggplot(aes(x = Sample_Type, y = Inhibition, group = Study_ID)) + 
+    facet_wrap(~VOC, scales = "free_x") +
+    geom_line(alpha = 0.25) +
+    geom_point(size = 2) + 
+    geom_boxplot(inherit.aes = FALSE,
+      mapping = aes(x = Sample_Type, y = Inhibition),
+      alpha = 0,
+      size = 0.5) +
+    labs(
+      x = 'Visit',
+      y = '% Inhibition') +
+      #caption = paste0("N = ", n_daycombined)) +
+    scale_x_discrete(
+      breaks = c('D4_pre', 'D4_post'),
+      labels = c('Pre', 'Post'),
+      limits = rev(levels(D4.postCombined.data$Sample_Type))) +
+    scale_y_continuous(limits = c(0,106)) +
+    stat_compare_means(
+      inherit.aes = FALSE,
+      mapping = aes(x = Sample_Type, y = Inhibition),
+      size = 5,
+      label = "p.signif",
+      symnum.args = list(cutpoints = c(0, 0.001, 0.01, 0.05, 1), symbols = c("***", "**", "*", "ns")),
+      comparisons = list( c("D4_pre", "D4_post")),
+      label.x.npc = 0.25, 
+      label.y.npc = 0.8,
+      method = 'wilcox.test',
+      paired = TRUE,
+      show.legend = TRUE) +
+    theme_classic() +
+    theme(
+      plot.title = element_text(hjust = 0.5),
+      title = element_text(size = fontpref-3, face = 'bold'),
+      #axis.title.x = element_blank(),
+      axis.title.x = element_text(size = fontpref, face = 'bold'),
+      axis.title.y = element_text(size = fontpref, face = 'bold', margin=margin(0,20,0,0)),
+      strip.text = element_text(size = fontpref, face = 'bold'),#-6
+      axis.text.y = element_text(size = fontpref, face = 'bold'),
+      plot.caption = element_text(size = fontpref-2, face = 'plain'),
+      legend.title = element_text(size = fontpref-2, face = 'bold'),
+      #legend.position = c(0.85, 0.12),
+      legend.direction = 'horizontal',
+      legend.position = "bottom",
+      legend.text = element_text(size = fontpref-5, face = 'bold'), 
+      legend.key.size = unit(2.5, 'line'),
+      axis.text.x = element_text(size = fontpref-2, angle = 0, vjust = 0.5, face = 'bold'),
+      axis.ticks.x = element_blank())
+  
+  ggsave(
+  #paired.90.ACE2.plot,
+  device = cairo_pdf,
+  filename = "ACE2 Inhibition Dose 4 Cohort PrePost Combined.pdf",
+  units = 'in',
+  width = 18,
+  height = 10
+)
+```
+
+
+```{r}
+Current_Date <- Sys.Date()
+#CoV_IgG_File_Name <- paste("CoV_IgG_", Current_Date, ".csv", sep = "")
+#CoV_IgG_File_Name
+
+ACE2_File_Name <- paste("ACE2_D4_", Current_Date, ".csv", sep = "")
+ACE2_File_Name
+
+#write_excel_csv(x = D4.postCombined.data2, file = CoV_IgG_File_Name)
+write_excel_csv(x = D4.postCombined.data2, file = ACE2_File_Name)
+
+```
+
+```{r Keeping tabs on sample numbers}
+D4.postCombined.data3 <- D4.postCombined.data2 %>%
+  pivot_wider(id_cols = c(Study_ID,VOC), names_from = Sample_Type, values_from = Inhibition) %>%
+  mutate(foldchange = (D4_post-D4_pre)/D4_pre) %>%
+  mutate(foldchange = case_when(is.nan(foldchange) ~ 0, TRUE ~ as.numeric(foldchange))) %>%
+  group_by(VOC)
+
+tapply(D4.postCombined.data3$foldchange, D4.postCombined.data3$VOC, summary)
+```
+
+
+```{r read in SOTR ACE2 Data and tidy}
+SOTR.data <- 
+read_csv(file = "ACE2_D4_2022-02-04.csv") %>% 
+  select(Study_ID, Sample_Type, Dose_Cohort, VOC, Inhibition) %>% 
+  filter(Sample_Type == "D4_post") %>% 
+  rename(Cohort = Dose_Cohort) %>% 
+  rename(Visit = Sample_Type) %>% 
+  mutate(Cohort = "SOTR") %>% 
+  mutate(Study_ID = as.character(Study_ID))
+head(SOTR.data)
+```
+```{r read in HC study IDs and ACE2 Data and Tidy}
+HC_IDs <- 
+read_excel(path = "Post boost only - Andrew_16Feb22.xlsx", sheet = "Sheet1", range = "A3:A28") %>% 
+  rename(Study_ID = `...1`) %>% 
+  filter(str_detect(Study_ID, "VR-"))
+HC_IDs
+
+HC.data <- 
+read_csv("ACE2_HCs_Omicron_2022-02-11.csv") %>% 
+  select(Study_ID, Visit, Cohort, VOC, Inhibition) %>% 
+  filter(Visit == "post boost") %>% 
+  filter(!is.na(VOC)) %>% 
+  filter(Study_ID %in% HC_IDs$Study_ID)
+
+head(HC.data)
+```
+```{r combine data and prep for viz}
+ACE2.post.data <- 
+SOTR.data %>% 
+  bind_rows(HC.data) %>% 
+  mutate(Cohort = factor(Cohort, levels = c("Healthy", "SOTR"))) %>% 
+  mutate(VOC = factor(VOC))
+
+ACE2.post.data
+```
+```{r}
+fontpref = 20
+
+ACE2.post.data %>%
+  ggplot(aes(x = Cohort, y = Inhibition)) + 
+    facet_wrap(~VOC, scales = "free_x") +
+    scale_fill_brewer(palette = "Set1") +
+    scale_colour_brewer(palette = "Set1")+
+    geom_boxplot(
+                aes(color = Cohort),
+                size = 1
+              ) +
+    geom_dotplot(
+                aes(fill = Cohort),
+                binaxis = 'y',
+                stackdir = 'center',
+                dotsize = 1) +
+    labs(
+      x = 'Cohort',
+      y = '% Inhibition',
+      caption = " ") +
+    scale_x_discrete(
+      breaks = c('SOTR', 'Healthy'),
+      labels = c('SOTR', 'HC')) +
+    scale_y_continuous(limits = c(0,106)) +
+    stat_compare_means(
+      size = 5,
+      label = "p.signif",
+      symnum.args = list(cutpoints = c(0, 0.05, 1),
+                         symbols = c("***", "ns")),
+      label.x.npc = 0.5, 
+      label.y.npc = 0.92,
+      method = 'wilcox.test',
+      paired = FALSE,
+      show.legend = FALSE) +
+    theme_classic() +
+    theme(
+      plot.title = element_text(hjust = 0.5),
+      title = element_text(size = fontpref-3, face = 'bold'),
+      #axis.title.x = element_blank(),
+      axis.title.x = element_text(size = fontpref, face = 'bold'),
+      axis.title.y = element_text(size = fontpref, face = 'bold', margin=margin(0,20,0,0)),
+      strip.text = element_text(size = fontpref, face = 'bold'),#-6
+      axis.text.y = element_text(size = fontpref, face = 'bold'),
+      plot.caption = element_text(size = fontpref-2, face = 'plain'),
+      legend.title = element_text(size = fontpref-2, face = 'bold'),
+      #legend.position = c(0.85, 0.12),
+      legend.direction = 'horizontal',
+      legend.position = "none",
+      legend.text = element_text(size = fontpref-5, face = 'bold'), 
+      legend.key.size = unit(2.5, 'line'),
+      axis.text.x = element_text(size = fontpref-2, angle = 0, vjust = 0.5, face = 'bold'),
+      axis.ticks.x = element_blank())
+  
+  ggsave(
+  #paired.90.ACE2.plot,
+  device = cairo_pdf,
+  filename = "HCs vs SOTRs post boost.pdf",
+  units = 'in',
+  width = 18,
+  height = 10
+)
+```
+
+```{r}
+ACE2.post.data.hc <- ACE2.post.data %>%
+  filter(Cohort == "Healthy") %>%
+  pivot_wider(id_cols = c(Study_ID, Visit), names_from = VOC, values_from = Inhibition)
+
+ACE2.post.data.hc
+
+write_excel_csv(x = ACE2.post.data.hc, file = "Healthy Controls Used ACE2 vs HC Graph.csv")
+
+```
